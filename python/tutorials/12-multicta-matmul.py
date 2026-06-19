@@ -69,14 +69,14 @@ def matmul_set_block_size_hook(nargs):
     nargs["c_desc"].block_shape = [block_m, block_n]
 
 
-def make_matmul_configs(configs, num_ctas):
+def make_matmul_configs(configs, num_ctas, group_size_m=8):
     return [
         triton.Config(
             {
                 "BLOCK_M": block_m,
                 "BLOCK_N": block_n,
                 "BLOCK_K": block_k,
-                "GROUP_SIZE_M": 8,
+                "GROUP_SIZE_M": group_size_m,
                 "NUM_STAGES": num_stages,
             },
             num_stages=num_stages,
@@ -116,6 +116,19 @@ TWO_CTA_CONFIGS = make_matmul_configs(
         (512, 64, 64, 4, 4),
     ],
     num_ctas=2,
+)
+
+FOUR_CTA_CONFIGS = make_matmul_configs(
+    [
+        (256, 256, 64, 3, 4),
+        (256, 256, 64, 4, 4),
+        (256, 256, 64, 5, 4),
+        (512, 128, 64, 3, 4),
+        (512, 128, 64, 4, 4),
+        (512, 128, 64, 5, 4),
+    ],
+    num_ctas=4,
+    group_size_m=1,
 )
 
 WS_CONFIGS = make_matmul_configs(
@@ -168,6 +181,8 @@ matmul_kernel_1cta = triton.autotune(configs=MATMUL_CONFIGS, key=AUTOTUNE_KEY,
                                      do_bench=proton_autotune_do_bench)(matmul_kernel)
 matmul_kernel_2cta = triton.autotune(configs=TWO_CTA_CONFIGS, key=AUTOTUNE_KEY,
                                      do_bench=proton_autotune_do_bench)(matmul_kernel)
+matmul_kernel_4cta = triton.autotune(configs=FOUR_CTA_CONFIGS, key=AUTOTUNE_KEY,
+                                     do_bench=proton_autotune_do_bench)(matmul_kernel)
 matmul_kernel_2cta_ws = triton.autotune(configs=WS_CONFIGS, key=AUTOTUNE_KEY,
                                         do_bench=proton_autotune_do_bench)(matmul_kernel)
 
@@ -191,6 +206,8 @@ def matmul(a, b, *, num_ctas, warp_specialize=False, out=None):
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
     if warp_specialize:
         kernel = matmul_kernel_2cta_ws
+    elif num_ctas == 4:
+        kernel = matmul_kernel_4cta
     elif num_ctas == 2:
         kernel = matmul_kernel_2cta
     else:
@@ -237,15 +254,27 @@ def validate_and_inspect():
     compiled_ws = matmul(a, b, num_ctas=2, warp_specialize=True, out=out)
     torch.testing.assert_close(ref.to(torch.float32), out.to(torch.float32), atol=0.06, rtol=0.06)
 
+    compiled_4cta = matmul(a, b, num_ctas=4, out=out)
+    torch.testing.assert_close(ref.to(torch.float32), out.to(torch.float32), atol=0.06, rtol=0.06)
+
     ttgir = compiled_2cta.asm["ttgir"]
     ptx = compiled_2cta.asm["ptx"]
     ws_ttgir = compiled_ws.asm["ttgir"]
     ws_ptx = compiled_ws.asm["ptx"]
+    four_cta_ttgir = compiled_4cta.asm["ttgir"]
+    four_cta_ptx = compiled_4cta.asm["ptx"]
     print(f"TTGIR contains two_ctas: {'two_ctas' in ttgir}", flush=True)
     print(f"WS TTGIR contains two_ctas: {'two_ctas' in ws_ttgir}", flush=True)
     print(f"WS TTGIR contains ttg.warp_specialize: {'ttg.warp_specialize' in ws_ttgir}", flush=True)
+    print(f"4CTA TTGIR contains two_ctas: {'two_ctas' in four_cta_ttgir}", flush=True)
+    print(
+        f"4CTA TTGIR contains TMA multicast: {'async_tma_copy_global_to_local' in four_cta_ttgir and 'multicast' in four_cta_ttgir}",
+        flush=True)
     print(f"PTX contains cta_group::2: {'cta_group::2' in ptx}", flush=True)
     print(f"WS PTX contains cta_group::2: {'cta_group::2' in ws_ptx}", flush=True)
+    print(
+        f"4CTA PTX contains TMA multicast: {'cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster' in four_cta_ptx}",
+        flush=True)
 
 
 # %%
@@ -274,7 +303,7 @@ def benchmark(shapes=BENCHMARK_SHAPES, precision="fp16"):
 def benchmark_precision(shapes, precision):
     fp8_inputs = precision == "fp8"
     print(f"\n{precision.upper()} square shapes", flush=True)
-    print("    M=N=K       1CTA       2CTA     cuBLAS      best shapes", flush=True)
+    print("    M=N=K       1CTA       2CTA       4CTA     cuBLAS      best shapes", flush=True)
 
     for size in shapes:
         M = N = K = int(size)
@@ -296,8 +325,15 @@ def benchmark_precision(shapes, precision):
         ms_2cta = bench(lambda: matmul(a, b, num_ctas=2, out=c_triton))
         cfg_2cta = matmul_kernel_2cta.best_config
 
-        prefix = f"{size:>9} {tflops(ms_1cta, M, N, K):>10.2f} {tflops(ms_2cta, M, N, K):>10.2f}"
-        shape_text = f"{fmt_config(cfg_1cta)} / {fmt_config(cfg_2cta)}"
+        compiled_4cta = matmul(a, b, num_ctas=4, out=c_triton)
+        if "multicast" not in compiled_4cta.asm["ttgir"]:
+            raise RuntimeError("4CTA autotune selected a kernel without TMA multicast")
+        ms_4cta = bench(lambda: matmul(a, b, num_ctas=4, out=c_triton))
+        cfg_4cta = matmul_kernel_4cta.best_config
+
+        prefix = (f"{size:>9} {tflops(ms_1cta, M, N, K):>10.2f}"
+                  f" {tflops(ms_2cta, M, N, K):>10.2f} {tflops(ms_4cta, M, N, K):>10.2f}")
+        shape_text = f"{fmt_config(cfg_1cta)} / {fmt_config(cfg_2cta)} / {fmt_config(cfg_4cta)}"
         b_trans = b.T.contiguous()
         if fp8_inputs:
             c_ref = torch.empty((M, N), device=str(DEVICE), dtype=torch.float8_e4m3fn)
