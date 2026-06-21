@@ -188,24 +188,6 @@ DotCTASplit getDotCTASplit(int64_t m, int64_t n, unsigned numCTAs,
   return {splitM, splitN};
 }
 
-bool hasDescriptorLoadLikeRoot(Value value) {
-  while (auto cvtOp = value.getDefiningOp<ttg::ConvertLayoutOp>())
-    value = cvtOp.getSrc();
-  return isa_and_nonnull<triton::DescriptorLoadLikeOpInterface>(
-      value.getDefiningOp());
-}
-
-bool preferMOnlySplitForTwoCTAMMA(triton::DotOp dot, bool isBlackwell) {
-  if (!isBlackwell || ttg::lookupNumCTAs(dot) != 4)
-    return false;
-
-  auto retTy = cast<RankedTensorType>(dot.getType());
-  if (retTy.getRank() != 2 || retTy.getDimSize(1) > 256)
-    return false;
-
-  return hasDescriptorLoadLikeRoot(dot.getB());
-}
-
 void assignDotCTALayout(triton::DotOp dot, bool isBlackwell) {
   MLIRContext *ctx = dot.getContext();
 
@@ -217,9 +199,20 @@ void assignDotCTALayout(triton::DotOp dot, bool isBlackwell) {
   auto bLayout = cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
   auto dLayout = cast<ttg::BlockedEncodingAttr>(dTy.getEncoding());
 
+  bool preferMOnlySplit = false;
+  if (isBlackwell && ttg::lookupNumCTAs(dot) == 4 && dTy.getRank() == 2 &&
+      dTy.getDimSize(1) <= 256) {
+    Value b = dot.getB();
+    while (auto cvtOp = b.getDefiningOp<ttg::ConvertLayoutOp>())
+      b = cvtOp.getSrc();
+    preferMOnlySplit =
+        isa_and_nonnull<triton::DescriptorLoadLikeOpInterface>(
+            b.getDefiningOp());
+  }
+
   DotCTASplit split = getDotCTASplit(
       dTy.getShape()[0], dTy.getShape()[1], ttg::getNumCTAs(dLayout),
-      preferMOnlySplitForTwoCTAMMA(dot, isBlackwell));
+      preferMOnlySplit);
 
   OpBuilder builder(dot);
   int threadsPerWarp = ttg::lookupThreadsPerWarp(builder);
